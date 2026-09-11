@@ -1,0 +1,48 @@
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# Environment and local secrets
+.env
+.env.*
+!.env.example
+
+# Nested third-party repository metadata
+models/yolov5_face/.git.yolov5-face-backup/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+build/
+dist/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local datasets and generated artifacts
+datasets/
+runs/
+reports/figures/
+reports/confusion_matrix/
+reports/data/
+
+# Large checkpoints
+*.pth
+
+# Generated reports and logs
+*.log
+*.pdf
+jaffe_label_*.txt

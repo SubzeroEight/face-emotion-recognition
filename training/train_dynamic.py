@@ -1,0 +1,162 @@
+import argparse
+import math
+import os
+import numpy as np
+import torch
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
+
+from config import DEFAULT_DYNAMIC_RUN_DIR, DEFAULT_IMAGE_DATASET_DIR
+from data_loader.dynamic import calculate_class_weights, get_dataloaders, update_weights
+from models.networks import coatnet_1
+from training.engine import evaluate, train_one_epoch
+
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+
+def main(opt):
+    print(opt)  # 1.读取一些配置参数，并且输出
+    assert os.path.exists(opt.data_path), "{} dose not exists.".format(opt.data_path)
+
+    weights_dir = os.path.join(opt.output, "weights")
+    logs_dir = os.path.join(opt.output, "logs")
+
+    os.makedirs(weights_dir, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
+
+    tb_writer = SummaryWriter(log_dir=logs_dir)  # 日志保存在 output/logs
+
+    # 设备
+    device = torch.device('cuda' if torch.cuda.is_available() and opt.use_cuda else "cpu")
+    print(f'device is {device}')
+
+    weights = calculate_class_weights(opt).to(device)  # 初始化样本权重
+    train_loader, test_loader = get_dataloaders(opt, weights)
+
+    nw = min([os.cpu_count(), opt.batch_size, opt.num_worker if opt.batch_size > 1 else 0, 8])
+    print('Using {} dataloader workers every process'.format(nw))
+
+    #   3.2 网络搭建：model
+    classes = opt.num_classes
+    model = coatnet_1(num_classes=classes)
+    model = model.to(device)
+    print(model)
+
+    #   3.3 优化器（学习率）
+    pg = [p for p in model.parameters() if p.requires_grad]
+    if opt.optimizer.lower() == 'sgd':  # 优化器
+        optimizer = torch.optim.SGD(pg, lr=opt.lr, momentum=0.9, weight_decay=5e-5)
+    elif opt.optimizer.lower() == 'adam':
+        optimizer = torch.optim.Adam(pg, lr=opt.lr, weight_decay=1e-3)
+    elif opt.optimizer.lower() == 'adamw':
+        optimizer = torch.optim.AdamW(pg, lr=opt.lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01)
+
+    # 调度器（更新策略） Scheduler https://arxiv.org/pdf/1812.01187.pdf
+    lf = lambda x: ((1 + math.cos(x * math.pi / opt.epochs)) / 2) * (1 - opt.lrf) + opt.lrf  # cosine
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # 调度器
+    # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [10, 20], 0.1)
+    # 损失函数
+    loss_function = torch.nn.CrossEntropyLoss(weight=weights)
+
+    start_epoch = 0
+    if opt.resume:
+        resume_path = os.path.join(weights_dir, f'ckpt_epoch_{opt.resume}.pth')
+        assert os.path.exists(resume_path), "{} dose not exists.".format(opt.resume)
+        checkpoint = torch.load(resume_path, map_location="cpu")
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])  # 人家没有
+        start_epoch = checkpoint["epoch"] + 1
+        print(f"---------------------------------Resuming form {opt.resume}---------------------------------")
+
+    elif opt.resume_best_epoch:
+        resume_path = os.path.join(weights_dir, f'best_model.pth')
+        assert os.path.exists(resume_path), "{} dose not exists.".format(opt.resume)
+        checkpoint = torch.load(resume_path, map_location="cpu")
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1
+        print(f"---------------------------------Resuming form {opt.resume}---------------------------------")
+
+    best_acc = checkpoint["val_acc"] if opt.resume or opt.resume_best_epoch else -np.inf
+    print("best_acc:", best_acc)
+    print("----------------------------------Start training-------------------------------------------------")
+    for epoch in tqdm(range(opt.epochs-start_epoch)):
+        # train  （本次epoch的平均损失和正确率）
+        train_loss, train_acc = train_one_epoch(model, train_loader, device, optimizer, loss_function, epoch=epoch)
+        scheduler.step()  # 根据预定义的策略调整优化器的学习率
+        #  eval
+        val_loss, val_acc = evaluate(model, test_loader, device, loss_function, epoch)
+        # 损失函数权重更新
+        loss_function.weight = update_weights(model, train_loader)
+
+        # 训练过程记录
+        tb_writer.add_scalar("Train_Loss", train_loss, epoch)
+        tb_writer.add_scalar('Train_Acc', train_acc, epoch)
+        tb_writer.add_scalar('Val_Loss', val_loss, epoch)
+        tb_writer.add_scalar('Val_Acc', val_acc, epoch)
+        tb_writer.add_scalar('Learning_rate', optimizer.param_groups[0]["lr"], epoch)
+
+        tb_writer.add_scalars("Loss", {"Train": train_loss}, epoch)
+        tb_writer.add_scalars("Loss", {"Valid": val_loss}, epoch)
+        tb_writer.add_scalars("Accuracy", {"Train": train_acc}, epoch)
+        tb_writer.add_scalars("Accuracy", {"Valid": val_acc}, epoch)
+
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(device)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(device)
+        batch_images = next(iter(train_loader))[0].to(device)
+        batch_images = batch_images * std + mean  # 反归一化
+        batch_images = torch.clamp(batch_images, 0, 1)  # 确保像素值在 [0, 1]
+        tb_writer.add_images('images', batch_images, epoch)
+
+        # 模型保存
+        if epoch % 10 == 0 or epoch == opt.epochs-1:
+            model_path = os.path.join(weights_dir, f"ckpt_epoch_{epoch}.pth")
+            save_state = {'model_state_dict': model.state_dict(),
+                          'train_acc': train_acc,
+                          'val_acc': val_acc,
+                          'epoch': epoch,
+                          'optimizer_state_dict': optimizer.state_dict(),
+                          'scheduler_state_dict': scheduler.state_dict()
+                          }
+            torch.save(save_state, model_path)
+
+        is_best = val_acc > best_acc  # val_acc是epoch中的平均val acc
+        if is_best:
+            best_acc = val_acc
+            print(f"best_acc:{best_acc}, epoch:{epoch}")
+            best_model_path = os.path.join(weights_dir, "best_model.pth")
+            save_state = {
+                'model_state_dict': model.state_dict(),
+                'train_acc': train_acc,
+                'val_acc': val_acc,
+                'epoch': epoch,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+            }
+            torch.save(save_state, best_model_path)
+    tb_writer.close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Facial expression classification model')
+    parser.add_argument('--data-path', type=str, default=str(DEFAULT_IMAGE_DATASET_DIR), help='The data path')
+    parser.add_argument('--epochs', type=int, default=150)
+    parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument('--num-worker', type=int, default=4)
+    parser.add_argument('--lr', type=float, default=0.0005)
+    parser.add_argument('--lrf', type=float, default=0.01)
+
+    parser.add_argument('--num-classes', default=7, type=int, help="Number of classes")
+    parser.add_argument('--resume', default='', help='resume from checkpoint')
+    parser.add_argument('--resume-best-epoch', default=False, help='resume from checkpoint')
+    parser.add_argument('--image-size', default=224, type=int, help="Input image size")
+    parser.add_argument('--output', default=str(DEFAULT_DYNAMIC_RUN_DIR), type=str, metavar='PATH', help='root of output folder')
+
+    parser.add_argument('--use_cuda', default=True)
+    parser.add_argument('--optimizer', type=str, default='adamw')  # sgd,adam,adamw
+
+    args = parser.parse_args()
+
+    main(opt=args)
