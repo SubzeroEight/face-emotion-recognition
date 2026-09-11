@@ -6,8 +6,8 @@
 
 | 界面 1 | 界面 2 |
 | :---: | :---: |
-| ![人脸表情识别系统界面截图 1](001.png) | ![人脸表情识别系统界面截图 2](002.png) |
-| ![人脸表情识别系统界面截图 3](003.png) | ![人脸表情识别系统界面截图 4](004.png) |
+| ![人脸表情识别系统界面截图 1](https://cdn.jsdelivr.net/gh/SubzeroEight/face-emotion-recognition@main/001.png) | ![人脸表情识别系统界面截图 2](https://cdn.jsdelivr.net/gh/SubzeroEight/face-emotion-recognition@main/002.png) |
+| ![人脸表情识别系统界面截图 3](https://cdn.jsdelivr.net/gh/SubzeroEight/face-emotion-recognition@main/003.png) | ![人脸表情识别系统界面截图 4](https://cdn.jsdelivr.net/gh/SubzeroEight/face-emotion-recognition@main/004.png) |
 
 表情类别为：
 
